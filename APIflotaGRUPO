@@ -1,0 +1,401 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import json
+import io
+import re
+import time
+from datetime import datetime
+
+# ==========================================
+# 1. CONSTANTES Y CONFIGURACIÓN
+# ==========================================
+WIALON_BASE_URL = "https://hst-api.wialon.com/wialon/ajax.html"
+
+st.set_page_config(page_title="Auditoría Wialon - Ley de Tránsito", layout="wide")
+
+# ==========================================
+# 2. CLASES DEL BACKEND (CONEXIÓN API WIALON)
+# ==========================================
+class WialonExtractor:
+    def __init__(self, token: str):
+        self.token = token
+        self.eid = None
+        
+        # Configuración de resiliencia de red (Evita caídas por microcortes o NameResolutionError)
+        self.session = requests.Session()
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[ 500, 502, 503, 504 ])
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+        
+    def login(self) -> str:
+        res = self.session.get(WIALON_BASE_URL, params={"svc": "token/login", "params": json.dumps({"token": self.token})}).json()
+        if "error" in res: raise ValueError(f"Falla en autenticación Wialon. Código: {res['error']}")
+        self.eid = res["eid"]
+        return self.eid
+
+    def get_all_units(self) -> dict:
+        spec = {"spec": {"itemsType": "avl_unit", "propName": "sys_name", "propValueMask": "*", "sortType": "sys_name"}, "force": 1, "flags": 1, "from": 0, "to": 0}
+        res = self.session.get(WIALON_BASE_URL, params={"svc": "core/search_items", "params": json.dumps(spec), "sid": self.eid}).json()
+        return {item['id']: item['nm'] for item in res.get('items', [])}
+
+    def get_all_unit_groups(self) -> dict:
+        spec = {"spec": {"itemsType": "avl_unit_group", "propName": "sys_name", "propValueMask": "*", "sortType": "sys_name"}, "force": 1, "flags": 1, "from": 0, "to": 0}
+        res = self.session.get(WIALON_BASE_URL, params={"svc": "core/search_items", "params": json.dumps(spec), "sid": self.eid}).json()
+        return {item['id']: item['nm'] for item in res.get('items', [])}
+
+    def get_report_templates(self) -> dict:
+        spec = {"spec": {"itemsType": "avl_resource", "propType": "propitemname", "propName": "reporttemplates", "propValueMask": "*", "sortType": "sys_name"}, "force": 1, "flags": 8193, "from": 0, "to": 0}
+        res = self.session.get(WIALON_BASE_URL, params={"svc": "core/search_items", "params": json.dumps(spec), "sid": self.eid}).json()
+        templates = {}
+        for resource in res.get('items', []):
+            res_id = resource['id']
+            for rep_id, rep_data in resource.get('rep', {}).items():
+                templates[f"{resource['nm']} - {rep_data['n']}"] = (res_id, int(rep_id))
+        return templates
+
+    def execute_and_download_report(self, res_id: int, tmpl_id: int, target_id: int, start_ts: int, end_ts: int) -> dict:
+        self.session.get(WIALON_BASE_URL, params={"svc": "report/cleanup_result", "params": "{}", "sid": self.eid})
+        exec_params = {"reportResourceId": res_id, "reportTemplateId": tmpl_id, "reportObjectId": target_id, "reportObjectSecId": 0, "interval": {"from": start_ts, "to": end_ts, "flags": 0}}
+        res = self.session.get(WIALON_BASE_URL, params={"svc": "report/exec_report", "params": json.dumps(exec_params), "sid": self.eid}).json()
+        
+        if "error" in res: raise RuntimeError(f"Error ejecutando reporte. Código Wialon: {res['error']}")
+        
+        tables = res.get('reportResult', {}).get('tables', [])
+        result_dfs = {}
+        
+        for index, table in enumerate(tables):
+            table_name = table.get('label', f'Tabla_{index}')
+            headers = table.get('header', [])
+            rows_count = table.get('rows', 0)
+            level = table.get('level', 1)
+            
+            if rows_count == 0:
+                result_dfs[table_name] = pd.DataFrame(columns=headers)
+                continue
+            
+            if level > 1:
+                row_params = {"tableIndex": index, "config": {"type": "range", "data": {"from": 0, "to": rows_count - 1, "level": 10}}}
+                res_rows = self.session.get(WIALON_BASE_URL, params={"svc": "report/select_result_rows", "params": json.dumps(row_params), "sid": self.eid}).json()
+            else:
+                row_params = {"tableIndex": index, "indexFrom": 0, "indexTo": rows_count - 1}
+                res_rows = self.session.get(WIALON_BASE_URL, params={"svc": "report/get_result_rows", "params": json.dumps(row_params), "sid": self.eid}).json()
+                
+            data = []
+            def extract_rows(rows_list):
+                for row in rows_list:
+                    if 'r' in row and isinstance(row['r'], list) and len(row['r']) > 0: extract_rows(row['r'])
+                    else:
+                        row_data = []
+                        for cell in row.get('c', []):
+                            val = cell.get('t', cell.get('v', '')) if isinstance(cell, dict) else cell
+                            row_data.append(str(val))
+                        data.append(row_data)
+
+            extract_rows(res_rows)
+            result_dfs[table_name] = pd.DataFrame(data, columns=headers)
+            
+        return result_dfs
+
+# ==========================================
+# 3. MOTOR DE LEY DE TRÁNSITO Y NLP
+# ==========================================
+class RulesEngine:
+    @staticmethod
+    def inferir_limite(calle: str) -> int:
+        texto = str(calle).lower().strip()
+        if re.search(r'\b(ruta|rn\d*|rp\d*|autopista|au\.|panamericana|acceso)\b', texto): return 110
+        elif re.search(r'\b(avenida|av\.|av|blvd|boulevard)\b', texto): return 60
+        else: return 40
+
+    @staticmethod
+    def procesar_infracciones(dfs_dict: dict, config: dict, current_target_name: str):
+        df_inf = pd.DataFrame()
+        col_loc = col_vel = col_cond = col_unidad_wialon = None
+        
+        # 1. Identificar tabla principal de Infracciones
+        for label, df in dfs_dict.items():
+            c_loc = next((col for col in df.columns if 'localización' in col.lower() or 'calle' in col.lower()), None)
+            c_vel = next((col for col in df.columns if 'velocidad' in col.lower() or 'máx' in col.lower()), None)
+            if c_loc and c_vel and not df.empty:
+                df_inf = df.copy()
+                col_loc, col_vel = c_loc, c_vel
+                col_cond = next((col for col in df.columns if 'conductor' in col.lower() or 'chofer' in col.lower()), None)
+                col_unidad_wialon = next((col for col in df.columns if 'unidad' in col.lower() or 'vehículo' in col.lower() or 'vehiculo' in col.lower()), None)
+                break
+
+        if df_inf.empty or not col_loc or not col_vel:
+            return pd.DataFrame(), []
+
+        # 2. Estandarizar Unidad y Conductor en df_inf
+        if col_unidad_wialon:
+            df_inf.rename(columns={col_unidad_wialon: 'Unidad'}, inplace=True)
+        else:
+            df_inf['Unidad'] = current_target_name # Fallback si procesamos unit by unit
+            
+        if col_cond:
+            df_inf.rename(columns={col_cond: 'Conductor'}, inplace=True)
+            df_inf['Conductor'] = df_inf['Conductor'].replace(r'^\s*[-]*\s*$', 'Sin identificar', regex=True).fillna('Sin identificar')
+        else:
+            df_inf['Conductor'] = "Sin asignar (Falta columna)"
+
+        # 3. Procesamiento de velocidades y severidad
+        extracted_vel = df_inf[col_vel].astype(str).str.extract(r'(\d+[\.,]?\d*)')[0]
+        df_inf['Vel. Registrada'] = extracted_vel.str.replace(',', '.').astype(float).round(0).astype(int)
+        df_inf['Límite Art. 51'] = df_inf[col_loc].apply(RulesEngine.inferir_limite).astype(int)
+        df_inf['Exceso_KM'] = (df_inf['Vel. Registrada'] - df_inf['Límite Art. 51']).astype(int)
+        
+        conditions = [
+            (df_inf['Exceso_KM'] >= config['leve_min']) & (df_inf['Exceso_KM'] < config['medio_min']),
+            (df_inf['Exceso_KM'] >= config['medio_min']) & (df_inf['Exceso_KM'] < config['grave_min']),
+            (df_inf['Exceso_KM'] >= config['grave_min'])
+        ]
+        df_inf['Severidad'] = np.select(conditions, ['Leve', 'Media', 'Grave'], default='OK')
+
+        # 4. Identificar tabla de Métricas Operativas
+        def parse_time(val):
+            val = str(val).strip()
+            if ':' in val:
+                parts = val.split(':')
+                try:
+                    if len(parts) == 3: return int(parts[0]) + int(parts[1])/60 + int(parts[2])/3600
+                    elif len(parts) == 2: return int(parts[0]) + int(parts[1])/60
+                except: return 0.0
+            num = re.search(r'(\d+[\.,]?\d*)', val)
+            return float(num.group(1).replace(',', '.')) if num else 0.0
+
+        df_metricas = None
+        for label, df in dfs_dict.items():
+            if 'motor' in label.lower() or 'estadística' in label.lower() or 'resumen' in label.lower():
+                df_metricas = df.copy()
+                break
+                
+        if df_metricas is None: df_metricas = df_inf.copy()
+
+        c_cond_met = next((col for col in df_metricas.columns if 'conductor' in col.lower() or 'chofer' in col.lower()), None)
+        c_unidad_met = next((col for col in df_metricas.columns if 'unidad' in col.lower() or 'vehículo' in col.lower() or 'vehiculo' in col.lower()), None)
+        c_hm = next((col for col in df_metricas.columns if 'motor' in col.lower() or 'horas' in col.lower()), None)
+        c_km = next((col for col in df_metricas.columns if 'kilometraje' in col.lower() or 'km' in col.lower() or 'distancia' in col.lower()), None)
+
+        if c_cond_met:
+            df_metricas['Conductor_Met'] = df_metricas[c_cond_met].replace(r'^\s*[-]*\s*$', 'Sin identificar', regex=True).fillna('Sin identificar')
+        if c_unidad_met:
+            df_metricas['Unidad_Met'] = df_metricas[c_unidad_met]
+        else:
+            df_metricas['Unidad_Met'] = current_target_name
+
+        # 5. Agrupación y Cálculo RSV por Unidad y Conductor
+        stats_rsv_list = []
+        
+        unidades_unicas = df_inf['Unidad'].unique().tolist()
+        
+        for unidad in unidades_unicas:
+            df_unidad_inf = df_inf[df_inf['Unidad'] == unidad]
+            df_unidad_met = df_metricas[df_metricas['Unidad_Met'] == unidad] if 'Unidad_Met' in df_metricas.columns else df_metricas
+
+            conductores_inf = df_unidad_inf['Conductor'].unique().tolist()
+            conductores_met = df_unidad_met['Conductor_Met'].unique().tolist() if 'Conductor_Met' in df_unidad_met.columns else []
+            todos_conductores = set(conductores_inf + conductores_met)
+            if not todos_conductores: todos_conductores = ["Sin identificar"]
+
+            for driver in todos_conductores:
+                df_driver_inf = df_unidad_inf[df_unidad_inf['Conductor'] == driver]
+                leves = len(df_driver_inf[df_driver_inf['Severidad'] == 'Leve'])
+                medias = len(df_driver_inf[df_driver_inf['Severidad'] == 'Media'])
+                graves = len(df_driver_inf[df_driver_inf['Severidad'] == 'Grave'])
+                
+                if 'Conductor_Met' in df_unidad_met.columns:
+                    df_driver_met = df_unidad_met[df_unidad_met['Conductor_Met'] == driver]
+                else:
+                    df_driver_met = df_unidad_met 
+
+                total_hm = df_driver_met[c_hm].apply(parse_time).sum() if c_hm and not df_driver_met.empty else 0.0
+                total_km = 0.0
+                if c_km and not df_driver_met.empty:
+                    km_str = df_driver_met[c_km].astype(str).str.extract(r'(\d+[\.,]?\d*)')[0]
+                    total_km = km_str.str.replace(',', '.').astype(float).sum()
+
+                hm_calc = total_hm if total_hm > 0 else 1.0 
+                scoring = (leves * 1) + (medias * 1.5) + (graves * 2)
+                icm = round(scoring / hm_calc, 2)
+
+                if icm < 2.0: perfil = "Seguro (Verde)"
+                elif icm < 5.0: perfil = "Preventivo (Amarillo)"
+                elif icm < 8.0: perfil = "Riesgoso (Naranja)"
+                else: perfil = "Inaceptable (Rojo)"
+
+                if total_hm > 0 or total_km > 0 or len(df_driver_inf) > 0:
+                    stats_rsv_list.append({
+                        "Unidad": unidad,
+                        "Conductor": driver,
+                        "Infracciones Leves": leves,
+                        "Infracciones Medias": medias,
+                        "Infracciones Altas": graves,
+                        "Horas Motor": round(total_hm, 2),
+                        "Kilometraje Total": round(total_km, 2),
+                        "Total Scoring": scoring,
+                        "Puntaje ICM": icm,
+                        "Perfil Conductor": perfil
+                    })
+
+        # 6. Preparar DataFrame de detalle visual
+        df_infracciones_filtradas = df_inf[df_inf['Severidad'] != 'OK'].copy()
+        if not df_infracciones_filtradas.empty:
+            cols = df_infracciones_filtradas.columns.tolist()
+            if 'Unidad' in cols:
+                cols.insert(0, cols.pop(cols.index('Unidad')))
+            if 'Conductor' in cols:
+                cols.insert(1, cols.pop(cols.index('Conductor')))
+            df_infracciones_filtradas = df_infracciones_filtradas[cols]
+            
+        return df_infracciones_filtradas, stats_rsv_list
+
+# ==========================================
+# 4. INTERFAZ FRONTEND (STREAMLIT)
+# ==========================================
+if 'wialon' not in st.session_state:
+    st.session_state.wialon = None
+if 'templates' not in st.session_state:
+    st.session_state.templates = {}
+
+st.title("Reporte de Excesos en Tiempo Real (Integración Wialon API)")
+
+with st.sidebar:
+    st.header("🔑 Autenticación")
+    wialon_token = st.text_input("Token Wialon Hosting", type="password")
+    if st.button("Conectar"):
+        try:
+            extractor = WialonExtractor(wialon_token)
+            extractor.login()
+            st.session_state.wialon = extractor
+            st.session_state.templates = extractor.get_report_templates()
+            st.success("¡Conectado! Listando plantillas y unidades...")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+            
+    st.markdown("---")
+    st.header("⚙️ Tolerancias (km/h excedidos)")
+    cfg_leve = st.number_input("Leve +km/h", value=10) 
+    cfg_medio = st.number_input("Medio +km/h", value=20)
+    cfg_grave = st.number_input("Grave +km/h", value=30)
+
+if st.session_state.wialon:
+    st.markdown("---")
+    if 'real_units' not in st.session_state:
+        st.session_state.real_units = st.session_state.wialon.get_all_units()
+    if 'real_groups' not in st.session_state:
+        st.session_state.real_groups = st.session_state.wialon.get_all_unit_groups()
+            
+    plantilla_seleccionada = st.selectbox("1️⃣ Seleccioná la Plantilla de Wialon", list(st.session_state.templates.keys()))
+    
+    tipo_auditoria = st.radio("2️⃣ Seleccioná el alcance de la auditoría:", ["Por Unidades Individuales", "Por Grupos de Unidades"], horizontal=True)
+    
+    col1, col2 = st.columns(2)
+    with col1: 
+        if tipo_auditoria == "Por Unidades Individuales":
+            name_to_id = {v: k for k, v in st.session_state.real_units.items()}
+            elementos_seleccionados = st.multiselect("3️⃣ Seleccioná las Unidades", sorted(list(name_to_id.keys())))
+        else:
+            name_to_id = {v: k for k, v in st.session_state.real_groups.items()}
+            elementos_seleccionados = st.multiselect("3️⃣ Seleccioná los Grupos", sorted(list(name_to_id.keys())))
+            st.caption("⚠️ Obligatorio: La plantilla en Wialon debe incluir columna 'Unidad' o 'Vehículo'.")
+
+    with col2:
+        col_d1, col_d2 = st.columns(2)
+        with col_d1: d_start = st.date_input("Fecha Inicio")
+        with col_d2: d_end = st.date_input("Fecha Fin")
+        
+    if st.button("Generar Reportes", type="primary"):
+        if not elementos_seleccionados or not plantilla_seleccionada:
+            st.warning("Seleccioná la plantilla y al menos un elemento a auditar.")
+        else:
+            with st.spinner("Analizando operación y cruzando datos masivos..."):
+                start_ts = int(time.mktime(d_start.timetuple()))
+                end_ts = int(time.mktime(d_end.timetuple())) + 86399 
+                res_id, tmpl_id = st.session_state.templates[plantilla_seleccionada]
+                config = {'leve_min': cfg_leve, 'medio_min': cfg_medio, 'grave_min': cfg_grave}
+                
+                df_master_infracciones = pd.DataFrame()
+                lista_rsv = [] 
+                all_raw_tables = {} 
+                
+                try:
+                    for nombre_elemento in elementos_seleccionados:
+                        target_id = name_to_id[nombre_elemento]
+                        
+                        dfs_dict = st.session_state.wialon.execute_and_download_report(res_id, tmpl_id, target_id, start_ts, end_ts)
+                        
+                        for label, df in dfs_dict.items():
+                            table_key = f"{nombre_elemento} - {label}"
+                            all_raw_tables[table_key] = df
+                        
+                        df_infract, stats_rsv_list = RulesEngine.procesar_infracciones(dfs_dict, config, nombre_elemento)
+                        
+                        if stats_rsv_list: 
+                            lista_rsv.extend(stats_rsv_list)
+                        
+                        if not df_infract.empty: 
+                            df_master_infracciones = pd.concat([df_master_infracciones, df_infract], ignore_index=True)
+                    
+                    st.success("✅ ¡Auditoría Finalizada con éxito!")
+                    
+                    tab1, tab2, tab3 = st.tabs(["📋 Detalle de Infracciones", "📊 Reporte tipo RSV", "💾 Tablas Originales"])
+                    
+                    with tab1:
+                        if not df_master_infracciones.empty:
+                            st.subheader(f"🚨 Se detectaron {len(df_master_infracciones)} infracciones en total.")
+                            def color_filas(val):
+                                if val == 'Grave': return 'background-color: #ffcccc'
+                                elif val == 'Media': return 'background-color: #fff0b3'
+                                elif val == 'Leve': return 'background-color: #e6f2ff'
+                                return ''
+                            st.dataframe(df_master_infracciones.style.map(color_filas, subset=['Severidad']), use_container_width=True, hide_index=True)
+                            
+                            buffer_det = io.BytesIO()
+                            with pd.ExcelWriter(buffer_det, engine='openpyxl') as writer:
+                                df_master_infracciones.to_excel(writer, index=False, sheet_name='Detalle')
+                            st.download_button("📥 Descargar Detalle (Excel)", data=buffer_det.getvalue(), file_name=f"Detalle_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        else:
+                            st.info("No hubo excesos de velocidad según los parámetros establecidos.")
+
+                    with tab2:
+                        if lista_rsv:
+                            df_rsv = pd.DataFrame(lista_rsv)
+                            st.subheader("Resumen de Seguridad Vial (RSV) y Evaluación por Conductor")
+                            
+                            def color_perfil(val):
+                                if 'Rojo' in str(val): return 'background-color: #ff4d4d; color: white;'
+                                if 'Naranja' in str(val): return 'background-color: #ffa64d;'
+                                if 'Amarillo' in str(val): return 'background-color: #ffff66;'
+                                if 'Verde' in str(val): return 'background-color: #85e085;'
+                                return ''
+                                
+                            st.dataframe(df_rsv.style.map(color_perfil, subset=['Perfil Conductor']), use_container_width=True, hide_index=True)
+                            
+                            buffer_rsv = io.BytesIO()
+                            with pd.ExcelWriter(buffer_rsv, engine='openpyxl') as writer:
+                                df_rsv.to_excel(writer, index=False, sheet_name='Reporte_RSV')
+                            st.download_button("📥 Descargar Reporte RSV (Excel)", data=buffer_rsv.getvalue(), file_name=f"RSV_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        else:
+                            st.warning("⚠️ No se pudieron generar datos RSV.")
+
+                    with tab3:
+                        st.subheader("Descarga directa de tablas de Wialon")
+                        for table_name, df_raw in all_raw_tables.items():
+                            if not df_raw.empty:
+                                buffer = io.BytesIO()
+                                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                                    df_raw.to_excel(writer, index=False, sheet_name=table_name[:31].replace(":", ""))
+                                
+                                st.download_button(
+                                    label=f"📥 Descargar {table_name}",
+                                    data=buffer.getvalue(),
+                                    file_name=f"{table_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"dl_{table_name}"
+                                )
+
+                except Exception as e:
+                    st.error(f"Error procesando la data: {str(e)}")
