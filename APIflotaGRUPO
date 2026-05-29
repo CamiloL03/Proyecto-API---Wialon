@@ -222,8 +222,8 @@ class RulesEngine:
                     "Infracciones Medias": medias,
                     "Infracciones Altas": graves,
                     "Horas Motor": round(total_hm, 2),
-                    "Kilometraje Total": int(round(total_km, 0)),
-                    "Total Scoring": scoring,
+                    "Kilometraje Total": round(total_km, 2),
+                    "Total Scoring": round(scoring, 2),
                     "Puntaje ICM": round(icm, 2)
                 })
 
@@ -281,8 +281,8 @@ class RulesEngine:
                     "Infracciones Medias": medias_c,
                     "Infracciones Altas": graves_c,
                     "Horas Motor": round(total_hm_c, 2),
-                    "Kilometraje Total": int(round(total_km_c, 0)),
-                    "Total Scoring": scoring_c,
+                    "Kilometraje Total": round(total_km_c, 2),
+                    "Total Scoring": round(scoring_c, 2),
                     "Puntaje ICM": round(icm_c, 2),
                     "Perfil Conductor": perfil
                 })
@@ -403,6 +403,14 @@ if st.session_state.wialon:
         lista_conductores = data["conductores"]
         all_raw_tables = data["tablas_crudas"]
 
+        # Formateador visual general {:g} para matar los ceros innecesarios a la derecha en la web
+        format_dict = {
+            'Horas Motor': '{:g}',
+            'Kilometraje Total': '{:g}',
+            'Total Scoring': '{:g}',
+            'Puntaje ICM': '{:g}'
+        }
+
         tab1, tab2, tab3, tab4 = st.tabs(["📋 Detalle Infracciones", "🚚 RSV Unidades", "👤 Evaluación Conductores", "💾 Tablas Originales"])
         
         with tab1:
@@ -425,11 +433,10 @@ if st.session_state.wialon:
         with tab2:
             if lista_rsv_unidades:
                 df_rsv_u = pd.DataFrame(lista_rsv_unidades)
-                # FORZADO DE TIPO ENTERO PARA EVITAR DECIMALES EN EXCEL Y WEB
-                df_rsv_u['Kilometraje Total'] = df_rsv_u['Kilometraje Total'].fillna(0).astype(int)
-                
                 st.subheader("Resumen de Seguridad Vial (Solo estado de las Unidades)")
-                st.dataframe(df_rsv_u, use_container_width=True, hide_index=True)
+                
+                # Renderizamos con el formateador dinámico para ocultar ceros
+                st.dataframe(df_rsv_u.style.format(format_dict), use_container_width=True, hide_index=True)
                 
                 buffer_rsv_u = io.BytesIO()
                 with pd.ExcelWriter(buffer_rsv_u, engine='openpyxl') as writer:
@@ -441,9 +448,6 @@ if st.session_state.wialon:
         with tab3:
             if lista_conductores:
                 df_cond = pd.DataFrame(lista_conductores)
-                # FORZADO DE TIPO ENTERO PARA EVITAR DECIMALES EN EXCEL Y WEB
-                df_cond['Kilometraje Total'] = df_cond['Kilometraje Total'].fillna(0).astype(int)
-                
                 st.subheader("Evaluación de Desempeño por Conductor (ICM)")
                 
                 def color_perfil(val):
@@ -452,7 +456,8 @@ if st.session_state.wialon:
                     if 'Verde' in str(val): return 'background-color: #85e085;'
                     return ''
                     
-                st.dataframe(df_cond.style.map(color_perfil, subset=['Perfil Conductor']), use_container_width=True, hide_index=True)
+                # Combinamos los colores con el formateador dinámico
+                st.dataframe(df_cond.style.map(color_perfil, subset=['Perfil Conductor']).format(format_dict), use_container_width=True, hide_index=True)
                 
                 buffer_cond = io.BytesIO()
                 with pd.ExcelWriter(buffer_cond, engine='openpyxl') as writer:
