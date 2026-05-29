@@ -122,14 +122,13 @@ class RulesEngine:
                 df_inf = df.copy()
                 col_loc, col_vel = c_loc, c_vel
                 col_cond = next((col for col in df.columns if 'conductor' in col.lower() or 'chofer' in col.lower()), None)
-                # NUEVO: Detección estricta de 'Agrupación' o 'Grouping' para las unidades
                 col_unidad_wialon = next((col for col in df.columns if any(x in col.lower() for x in ['agrupación', 'grouping', 'unidad', 'vehículo', 'vehiculo'])), None)
                 break
 
         if df_inf.empty or not col_loc or not col_vel:
             return pd.DataFrame(), [], []
 
-        # 2. Estandarizar Unidad y Conductor en df_inf
+        # 2. Estandarizar Unidad y Conductor
         if col_unidad_wialon:
             df_inf.rename(columns={col_unidad_wialon: 'Unidad'}, inplace=True)
         else:
@@ -141,7 +140,7 @@ class RulesEngine:
         else:
             df_inf['Conductor'] = "Sin asignar (Falta columna)"
 
-        # 3. Procesamiento de velocidades y severidad
+        # 3. Procesamiento de velocidades
         extracted_vel = df_inf[col_vel].astype(str).str.extract(r'(\d+[\.,]?\d*)')[0]
         df_inf['Vel. Registrada'] = extracted_vel.str.replace(',', '.').astype(float).round(0).astype(int)
         df_inf['Límite Art. 51'] = df_inf[col_loc].apply(RulesEngine.inferir_limite).astype(int)
@@ -154,17 +153,28 @@ class RulesEngine:
         ]
         df_inf['Severidad'] = np.select(conditions, ['Leve', 'Media', 'Grave'], default='OK')
 
-        # 4. Identificar tabla de Métricas Operativas
+        # 4. Tabla de Métricas Operativas y Parseo de Tiempos
         def parse_time(val):
             val = str(val).strip()
+            days_val = 0
+            
+            day_match = re.search(r'(\d+)\s*(?:days?|días?|dia|d)\b', val, flags=re.IGNORECASE)
+            if day_match:
+                days_val = int(day_match.group(1))
+                val = val[day_match.end():].strip()
+                
             if ':' in val:
                 parts = val.split(':')
                 try:
-                    if len(parts) == 3: return int(parts[0]) + int(parts[1])/60 + int(parts[2])/3600
-                    elif len(parts) == 2: return int(parts[0]) + int(parts[1])/60
+                    if len(parts) == 3: hours = int(parts[0]) + int(parts[1])/60 + int(parts[2])/3600
+                    elif len(parts) == 2: hours = int(parts[0]) + int(parts[1])/60
+                    else: hours = 0.0
+                    return (days_val * 24) + hours
                 except: return 0.0
+            
             num = re.search(r'(\d+[\.,]?\d*)', val)
-            return float(num.group(1).replace(',', '.')) if num else 0.0
+            try: return float(num.group(1).replace(',', '.')) if num else 0.0
+            except: return 0.0
 
         df_metricas = None
         for label, df in dfs_dict.items():
@@ -179,14 +189,11 @@ class RulesEngine:
         c_hm = next((col for col in df_metricas.columns if 'motor' in col.lower() or 'horas' in col.lower()), None)
         c_km = next((col for col in df_metricas.columns if 'kilometraje' in col.lower() or 'km' in col.lower() or 'distancia' in col.lower()), None)
 
-        if c_cond_met:
-            df_metricas['Conductor_Met'] = df_metricas[c_cond_met].replace(r'^\s*[-]*\s*$', 'Sin identificar', regex=True).fillna('Sin identificar')
-        if c_unidad_met:
-            df_metricas['Unidad_Met'] = df_metricas[c_unidad_met]
-        else:
-            df_metricas['Unidad_Met'] = current_target_name
+        if c_cond_met: df_metricas['Conductor_Met'] = df_metricas[c_cond_met].replace(r'^\s*[-]*\s*$', 'Sin identificar', regex=True).fillna('Sin identificar')
+        if c_unidad_met: df_metricas['Unidad_Met'] = df_metricas[c_unidad_met]
+        else: df_metricas['Unidad_Met'] = current_target_name
 
-        # --- A. CÁLCULO RSV POR UNIDAD (Sin Conductor) ---
+        # --- A. CÁLCULO RSV POR UNIDAD ---
         stats_rsv_unidades = []
         unidades_unicas = set(df_inf['Unidad'].unique().tolist() + (df_metricas['Unidad_Met'].unique().tolist() if 'Unidad_Met' in df_metricas.columns else []))
         
@@ -215,21 +222,35 @@ class RulesEngine:
                     "Infracciones Medias": medias,
                     "Infracciones Altas": graves,
                     "Horas Motor": round(total_hm, 2),
-                    "Kilometraje Total": round(total_km, 2),
+                    "Kilometraje Total": int(round(total_km, 0)),
                     "Total Scoring": scoring,
-                    "Puntaje ICM": icm
+                    "Puntaje ICM": round(icm, 2)
                 })
 
-        # --- B. CÁLCULO DE EVALUACIÓN POR CONDUCTOR (Métricas aisladas) ---
+        # --- B. CÁLCULO DE EVALUACIÓN POR CONDUCTOR ---
         stats_conductores = []
         conductores_unicos = set(df_inf['Conductor'].unique().tolist() + (df_metricas['Conductor_Met'].unique().tolist() if 'Conductor_Met' in df_metricas.columns else []))
         if not conductores_unicos: conductores_unicos = ["Sin identificar"]
 
         for driver in conductores_unicos:
             if pd.isna(driver): continue
+            if str(driver).strip() == "Sin asignar (Falta columna)": continue
             
             df_drv_inf = df_inf[df_inf['Conductor'] == driver]
-            df_drv_met = df_metricas[df_metricas['Conductor_Met'] == driver] if 'Conductor_Met' in df_metricas.columns else pd.DataFrame()
+            
+            if 'Conductor_Met' in df_metricas.columns:
+                df_drv_met = df_metricas[df_metricas['Conductor_Met'] == driver]
+            else:
+                unidades_del_chofer_inf = df_drv_inf['Unidad'].unique()
+                if len(unidades_del_chofer_inf) > 0:
+                    df_drv_met = df_metricas[df_metricas['Unidad_Met'].isin(unidades_del_chofer_inf)]
+                else:
+                    df_drv_met = df_metricas 
+
+            unidades_inf = df_drv_inf['Unidad'].unique().tolist()
+            unidades_met = df_drv_met['Unidad_Met'].unique().tolist() if 'Unidad_Met' in df_drv_met.columns else []
+            todas_las_unidades_del_chofer = sorted(list(set(unidades_inf + unidades_met)))
+            unidades_str = " / ".join(str(u) for u in todas_las_unidades_del_chofer) if todas_las_unidades_del_chofer else "Desconocida"
 
             leves_c = len(df_drv_inf[df_drv_inf['Severidad'] == 'Leve'])
             medias_c = len(df_drv_inf[df_drv_inf['Severidad'] == 'Media'])
@@ -245,38 +266,33 @@ class RulesEngine:
             scoring_c = (leves_c * 1) + (medias_c * 1.5) + (graves_c * 2)
             icm_c = round(scoring_c / hm_calc_c, 2)
 
-            # Lógica estricta de evaluación solicitada
             if total_km_c < 700:
-                if icm_c < 0.6:
-                    perfil = "Destacado (Verde)"
-                elif icm_c < 7.0:
-                    perfil = "Defensivo (Amarillo)"
-                else:
-                    perfil = "Ofensivo (Rojo)"
+                if icm_c < 0.6: perfil = "Destacado (Verde)"
+                elif icm_c < 7.0: perfil = "Defensivo (Amarillo)"
+                else: perfil = "Ofensivo (Rojo)"
             else:
-                perfil = "Ofensivo (Rojo)" # Automáticamente ofensivo si supera los 700km según requerimiento
+                perfil = "Ofensivo (Rojo)"
 
             if total_hm_c > 0 or total_km_c > 0 or len(df_drv_inf) > 0:
                 stats_conductores.append({
                     "Conductor": driver,
+                    "Unidad(es)": unidades_str,
                     "Infracciones Leves": leves_c,
                     "Infracciones Medias": medias_c,
                     "Infracciones Altas": graves_c,
                     "Horas Motor": round(total_hm_c, 2),
-                    "Kilometraje Total": round(total_km_c, 2),
+                    "Kilometraje Total": int(round(total_km_c, 0)),
                     "Total Scoring": scoring_c,
-                    "Puntaje ICM": icm_c,
+                    "Puntaje ICM": round(icm_c, 2),
                     "Perfil Conductor": perfil
                 })
 
-        # 6. Preparar DataFrame de detalle visual
+        # 6. Preparar DataFrame visual
         df_infracciones_filtradas = df_inf[df_inf['Severidad'] != 'OK'].copy()
         if not df_infracciones_filtradas.empty:
             cols = df_infracciones_filtradas.columns.tolist()
-            if 'Unidad' in cols:
-                cols.insert(0, cols.pop(cols.index('Unidad')))
-            if 'Conductor' in cols:
-                cols.insert(1, cols.pop(cols.index('Conductor')))
+            if 'Unidad' in cols: cols.insert(0, cols.pop(cols.index('Unidad')))
+            if 'Conductor' in cols: cols.insert(1, cols.pop(cols.index('Conductor')))
             df_infracciones_filtradas = df_infracciones_filtradas[cols]
             
         return df_infracciones_filtradas, stats_rsv_unidades, stats_conductores
@@ -288,6 +304,8 @@ if 'wialon' not in st.session_state:
     st.session_state.wialon = None
 if 'templates' not in st.session_state:
     st.session_state.templates = {}
+if 'resultados_auditoria' not in st.session_state:
+    st.session_state.resultados_auditoria = None
 
 st.title("Reporte de Excesos en Tiempo Real (Integración Wialon API)")
 
@@ -366,75 +384,95 @@ if st.session_state.wialon:
                         if stats_cond: lista_conductores.extend(stats_cond)
                         if not df_infract.empty: df_master_infracciones = pd.concat([df_master_infracciones, df_infract], ignore_index=True)
                     
+                    st.session_state.resultados_auditoria = {
+                        "infracciones": df_master_infracciones,
+                        "rsv": lista_rsv_unidades,
+                        "conductores": lista_conductores,
+                        "tablas_crudas": all_raw_tables
+                    }
                     st.success("✅ ¡Auditoría Finalizada con éxito!")
                     
-                    tab1, tab2, tab3, tab4 = st.tabs(["📋 Detalle Infracciones", "🚚 RSV Unidades", "👤 Evaluación Conductores", "💾 Tablas Originales"])
-                    
-                    with tab1:
-                        if not df_master_infracciones.empty:
-                            st.subheader(f"🚨 Se detectaron {len(df_master_infracciones)} infracciones en total.")
-                            def color_filas(val):
-                                if val == 'Grave': return 'background-color: #ffcccc'
-                                elif val == 'Media': return 'background-color: #fff0b3'
-                                elif val == 'Leve': return 'background-color: #e6f2ff'
-                                return ''
-                            st.dataframe(df_master_infracciones.style.map(color_filas, subset=['Severidad']), use_container_width=True, hide_index=True)
-                            
-                            buffer_det = io.BytesIO()
-                            with pd.ExcelWriter(buffer_det, engine='openpyxl') as writer:
-                                df_master_infracciones.to_excel(writer, index=False, sheet_name='Detalle')
-                            st.download_button("📥 Descargar Detalle (Excel)", data=buffer_det.getvalue(), file_name=f"Detalle_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                        else:
-                            st.info("No hubo excesos de velocidad según los parámetros establecidos.")
-
-                    with tab2:
-                        if lista_rsv_unidades:
-                            df_rsv_u = pd.DataFrame(lista_rsv_unidades)
-                            st.subheader("Resumen de Seguridad Vial (Solo estado de las Unidades)")
-                            st.dataframe(df_rsv_u, use_container_width=True, hide_index=True)
-                            
-                            buffer_rsv_u = io.BytesIO()
-                            with pd.ExcelWriter(buffer_rsv_u, engine='openpyxl') as writer:
-                                df_rsv_u.to_excel(writer, index=False, sheet_name='RSV_Unidades')
-                            st.download_button("📥 Descargar RSV Unidades (Excel)", data=buffer_rsv_u.getvalue(), file_name=f"RSV_Unidades_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                        else:
-                            st.warning("⚠️ No se pudieron generar datos para las unidades.")
-
-                    with tab3:
-                        if lista_conductores:
-                            df_cond = pd.DataFrame(lista_conductores)
-                            st.subheader("Evaluación de Desempeño por Conductor (ICM)")
-                            
-                            def color_perfil(val):
-                                if 'Rojo' in str(val): return 'background-color: #ff4d4d; color: white;'
-                                if 'Amarillo' in str(val): return 'background-color: #ffff66;'
-                                if 'Verde' in str(val): return 'background-color: #85e085;'
-                                return ''
-                                
-                            st.dataframe(df_cond.style.map(color_perfil, subset=['Perfil Conductor']), use_container_width=True, hide_index=True)
-                            
-                            buffer_cond = io.BytesIO()
-                            with pd.ExcelWriter(buffer_cond, engine='openpyxl') as writer:
-                                df_cond.to_excel(writer, index=False, sheet_name='Evaluacion_Conductores')
-                            st.download_button("📥 Descargar Evaluación (Excel)", data=buffer_cond.getvalue(), file_name=f"Eval_Conductores_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                        else:
-                            st.warning("⚠️ No se encontraron conductores en el reporte.")
-
-                    with tab4:
-                        st.subheader("Descarga directa de tablas de Wialon")
-                        for table_name, df_raw in all_raw_tables.items():
-                            if not df_raw.empty:
-                                buffer = io.BytesIO()
-                                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                                    df_raw.to_excel(writer, index=False, sheet_name=table_name[:31].replace(":", ""))
-                                
-                                st.download_button(
-                                    label=f"📥 Descargar {table_name}",
-                                    data=buffer.getvalue(),
-                                    file_name=f"{table_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"dl_{table_name}"
-                                )
-
                 except Exception as e:
                     st.error(f"Error procesando la data: {str(e)}")
+
+    # === RENDERIZADO VISUAL EN MEMORIA ===
+    if st.session_state.resultados_auditoria:
+        data = st.session_state.resultados_auditoria
+        df_master_infracciones = data["infracciones"]
+        lista_rsv_unidades = data["rsv"]
+        lista_conductores = data["conductores"]
+        all_raw_tables = data["tablas_crudas"]
+
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 Detalle Infracciones", "🚚 RSV Unidades", "👤 Evaluación Conductores", "💾 Tablas Originales"])
+        
+        with tab1:
+            if not df_master_infracciones.empty:
+                st.subheader(f"🚨 Se detectaron {len(df_master_infracciones)} infracciones en total.")
+                def color_filas(val):
+                    if val == 'Grave': return 'background-color: #ffcccc'
+                    elif val == 'Media': return 'background-color: #fff0b3'
+                    elif val == 'Leve': return 'background-color: #e6f2ff'
+                    return ''
+                st.dataframe(df_master_infracciones.style.map(color_filas, subset=['Severidad']), use_container_width=True, hide_index=True)
+                
+                buffer_det = io.BytesIO()
+                with pd.ExcelWriter(buffer_det, engine='openpyxl') as writer:
+                    df_master_infracciones.to_excel(writer, index=False, sheet_name='Detalle')
+                st.download_button("📥 Descargar Detalle (Excel)", data=buffer_det.getvalue(), file_name=f"Detalle_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_detalle")
+            else:
+                st.info("No hubo excesos de velocidad según los parámetros establecidos.")
+
+        with tab2:
+            if lista_rsv_unidades:
+                df_rsv_u = pd.DataFrame(lista_rsv_unidades)
+                # FORZADO DE TIPO ENTERO PARA EVITAR DECIMALES EN EXCEL Y WEB
+                df_rsv_u['Kilometraje Total'] = df_rsv_u['Kilometraje Total'].fillna(0).astype(int)
+                
+                st.subheader("Resumen de Seguridad Vial (Solo estado de las Unidades)")
+                st.dataframe(df_rsv_u, use_container_width=True, hide_index=True)
+                
+                buffer_rsv_u = io.BytesIO()
+                with pd.ExcelWriter(buffer_rsv_u, engine='openpyxl') as writer:
+                    df_rsv_u.to_excel(writer, index=False, sheet_name='RSV_Unidades')
+                st.download_button("📥 Descargar RSV Unidades (Excel)", data=buffer_rsv_u.getvalue(), file_name=f"RSV_Unidades_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_rsv")
+            else:
+                st.warning("⚠️ No se pudieron generar datos para las unidades.")
+
+        with tab3:
+            if lista_conductores:
+                df_cond = pd.DataFrame(lista_conductores)
+                # FORZADO DE TIPO ENTERO PARA EVITAR DECIMALES EN EXCEL Y WEB
+                df_cond['Kilometraje Total'] = df_cond['Kilometraje Total'].fillna(0).astype(int)
+                
+                st.subheader("Evaluación de Desempeño por Conductor (ICM)")
+                
+                def color_perfil(val):
+                    if 'Rojo' in str(val): return 'background-color: #ff4d4d; color: white;'
+                    if 'Amarillo' in str(val): return 'background-color: #ffff66;'
+                    if 'Verde' in str(val): return 'background-color: #85e085;'
+                    return ''
+                    
+                st.dataframe(df_cond.style.map(color_perfil, subset=['Perfil Conductor']), use_container_width=True, hide_index=True)
+                
+                buffer_cond = io.BytesIO()
+                with pd.ExcelWriter(buffer_cond, engine='openpyxl') as writer:
+                    df_cond.to_excel(writer, index=False, sheet_name='Evaluacion_Conductores')
+                st.download_button("📥 Descargar Evaluación (Excel)", data=buffer_cond.getvalue(), file_name=f"Eval_Conductores_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_eval")
+            else:
+                st.warning("⚠️ No se encontraron conductores en el reporte.")
+
+        with tab4:
+            st.subheader("Descarga directa de tablas de Wialon")
+            for table_name, df_raw in all_raw_tables.items():
+                if not df_raw.empty:
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        df_raw.to_excel(writer, index=False, sheet_name=table_name[:31].replace(":", ""))
+                    
+                    st.download_button(
+                        label=f"📥 Descargar {table_name}",
+                        data=buffer.getvalue(),
+                        file_name=f"{table_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_raw_{table_name}"
+                    )
