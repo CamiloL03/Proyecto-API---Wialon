@@ -25,7 +25,6 @@ class WialonExtractor:
         self.token = token
         self.eid = None
         
-        # Configuración de resiliencia de red (Evita caídas por microcortes o NameResolutionError)
         self.session = requests.Session()
         retries = Retry(total=5, backoff_factor=1, status_forcelist=[ 500, 502, 503, 504 ])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -123,17 +122,18 @@ class RulesEngine:
                 df_inf = df.copy()
                 col_loc, col_vel = c_loc, c_vel
                 col_cond = next((col for col in df.columns if 'conductor' in col.lower() or 'chofer' in col.lower()), None)
-                col_unidad_wialon = next((col for col in df.columns if 'unidad' in col.lower() or 'vehículo' in col.lower() or 'vehiculo' in col.lower()), None)
+                # NUEVO: Detección estricta de 'Agrupación' o 'Grouping' para las unidades
+                col_unidad_wialon = next((col for col in df.columns if any(x in col.lower() for x in ['agrupación', 'grouping', 'unidad', 'vehículo', 'vehiculo'])), None)
                 break
 
         if df_inf.empty or not col_loc or not col_vel:
-            return pd.DataFrame(), []
+            return pd.DataFrame(), [], []
 
         # 2. Estandarizar Unidad y Conductor en df_inf
         if col_unidad_wialon:
             df_inf.rename(columns={col_unidad_wialon: 'Unidad'}, inplace=True)
         else:
-            df_inf['Unidad'] = current_target_name # Fallback si procesamos unit by unit
+            df_inf['Unidad'] = current_target_name 
             
         if col_cond:
             df_inf.rename(columns={col_cond: 'Conductor'}, inplace=True)
@@ -175,7 +175,7 @@ class RulesEngine:
         if df_metricas is None: df_metricas = df_inf.copy()
 
         c_cond_met = next((col for col in df_metricas.columns if 'conductor' in col.lower() or 'chofer' in col.lower()), None)
-        c_unidad_met = next((col for col in df_metricas.columns if 'unidad' in col.lower() or 'vehículo' in col.lower() or 'vehiculo' in col.lower()), None)
+        c_unidad_met = next((col for col in df_metricas.columns if any(x in col.lower() for x in ['agrupación', 'grouping', 'unidad', 'vehículo', 'vehiculo'])), None)
         c_hm = next((col for col in df_metricas.columns if 'motor' in col.lower() or 'horas' in col.lower()), None)
         c_km = next((col for col in df_metricas.columns if 'kilometraje' in col.lower() or 'km' in col.lower() or 'distancia' in col.lower()), None)
 
@@ -186,59 +186,88 @@ class RulesEngine:
         else:
             df_metricas['Unidad_Met'] = current_target_name
 
-        # 5. Agrupación y Cálculo RSV por Unidad y Conductor
-        stats_rsv_list = []
-        
-        unidades_unicas = df_inf['Unidad'].unique().tolist()
+        # --- A. CÁLCULO RSV POR UNIDAD (Sin Conductor) ---
+        stats_rsv_unidades = []
+        unidades_unicas = set(df_inf['Unidad'].unique().tolist() + (df_metricas['Unidad_Met'].unique().tolist() if 'Unidad_Met' in df_metricas.columns else []))
         
         for unidad in unidades_unicas:
             df_unidad_inf = df_inf[df_inf['Unidad'] == unidad]
-            df_unidad_met = df_metricas[df_metricas['Unidad_Met'] == unidad] if 'Unidad_Met' in df_metricas.columns else df_metricas
+            df_unidad_met = df_metricas[df_metricas['Unidad_Met'] == unidad] if 'Unidad_Met' in df_metricas.columns else pd.DataFrame()
 
-            conductores_inf = df_unidad_inf['Conductor'].unique().tolist()
-            conductores_met = df_unidad_met['Conductor_Met'].unique().tolist() if 'Conductor_Met' in df_unidad_met.columns else []
-            todos_conductores = set(conductores_inf + conductores_met)
-            if not todos_conductores: todos_conductores = ["Sin identificar"]
+            leves = len(df_unidad_inf[df_unidad_inf['Severidad'] == 'Leve'])
+            medias = len(df_unidad_inf[df_unidad_inf['Severidad'] == 'Media'])
+            graves = len(df_unidad_inf[df_unidad_inf['Severidad'] == 'Grave'])
+            
+            total_hm = df_unidad_met[c_hm].apply(parse_time).sum() if c_hm and not df_unidad_met.empty else 0.0
+            total_km = 0.0
+            if c_km and not df_unidad_met.empty:
+                km_str = df_unidad_met[c_km].astype(str).str.extract(r'(\d+[\.,]?\d*)')[0]
+                total_km = km_str.str.replace(',', '.').astype(float).sum()
 
-            for driver in todos_conductores:
-                df_driver_inf = df_unidad_inf[df_unidad_inf['Conductor'] == driver]
-                leves = len(df_driver_inf[df_driver_inf['Severidad'] == 'Leve'])
-                medias = len(df_driver_inf[df_driver_inf['Severidad'] == 'Media'])
-                graves = len(df_driver_inf[df_driver_inf['Severidad'] == 'Grave'])
-                
-                if 'Conductor_Met' in df_unidad_met.columns:
-                    df_driver_met = df_unidad_met[df_unidad_met['Conductor_Met'] == driver]
+            hm_calc = total_hm if total_hm > 0 else 1.0 
+            scoring = (leves * 1) + (medias * 1.5) + (graves * 2)
+            icm = round(scoring / hm_calc, 2)
+
+            if total_hm > 0 or total_km > 0 or len(df_unidad_inf) > 0:
+                stats_rsv_unidades.append({
+                    "Unidad": unidad,
+                    "Infracciones Leves": leves,
+                    "Infracciones Medias": medias,
+                    "Infracciones Altas": graves,
+                    "Horas Motor": round(total_hm, 2),
+                    "Kilometraje Total": round(total_km, 2),
+                    "Total Scoring": scoring,
+                    "Puntaje ICM": icm
+                })
+
+        # --- B. CÁLCULO DE EVALUACIÓN POR CONDUCTOR (Métricas aisladas) ---
+        stats_conductores = []
+        conductores_unicos = set(df_inf['Conductor'].unique().tolist() + (df_metricas['Conductor_Met'].unique().tolist() if 'Conductor_Met' in df_metricas.columns else []))
+        if not conductores_unicos: conductores_unicos = ["Sin identificar"]
+
+        for driver in conductores_unicos:
+            if pd.isna(driver): continue
+            
+            df_drv_inf = df_inf[df_inf['Conductor'] == driver]
+            df_drv_met = df_metricas[df_metricas['Conductor_Met'] == driver] if 'Conductor_Met' in df_metricas.columns else pd.DataFrame()
+
+            leves_c = len(df_drv_inf[df_drv_inf['Severidad'] == 'Leve'])
+            medias_c = len(df_drv_inf[df_drv_inf['Severidad'] == 'Media'])
+            graves_c = len(df_drv_inf[df_drv_inf['Severidad'] == 'Grave'])
+            
+            total_hm_c = df_drv_met[c_hm].apply(parse_time).sum() if c_hm and not df_drv_met.empty else 0.0
+            total_km_c = 0.0
+            if c_km and not df_drv_met.empty:
+                km_str_c = df_drv_met[c_km].astype(str).str.extract(r'(\d+[\.,]?\d*)')[0]
+                total_km_c = km_str_c.str.replace(',', '.').astype(float).sum()
+
+            hm_calc_c = total_hm_c if total_hm_c > 0 else 1.0 
+            scoring_c = (leves_c * 1) + (medias_c * 1.5) + (graves_c * 2)
+            icm_c = round(scoring_c / hm_calc_c, 2)
+
+            # Lógica estricta de evaluación solicitada
+            if total_km_c < 700:
+                if icm_c < 0.6:
+                    perfil = "Destacado (Verde)"
+                elif icm_c < 7.0:
+                    perfil = "Defensivo (Amarillo)"
                 else:
-                    df_driver_met = df_unidad_met 
+                    perfil = "Ofensivo (Rojo)"
+            else:
+                perfil = "Ofensivo (Rojo)" # Automáticamente ofensivo si supera los 700km según requerimiento
 
-                total_hm = df_driver_met[c_hm].apply(parse_time).sum() if c_hm and not df_driver_met.empty else 0.0
-                total_km = 0.0
-                if c_km and not df_driver_met.empty:
-                    km_str = df_driver_met[c_km].astype(str).str.extract(r'(\d+[\.,]?\d*)')[0]
-                    total_km = km_str.str.replace(',', '.').astype(float).sum()
-
-                hm_calc = total_hm if total_hm > 0 else 1.0 
-                scoring = (leves * 1) + (medias * 1.5) + (graves * 2)
-                icm = round(scoring / hm_calc, 2)
-
-                if icm < 2.0: perfil = "Seguro (Verde)"
-                elif icm < 5.0: perfil = "Preventivo (Amarillo)"
-                elif icm < 8.0: perfil = "Riesgoso (Naranja)"
-                else: perfil = "Inaceptable (Rojo)"
-
-                if total_hm > 0 or total_km > 0 or len(df_driver_inf) > 0:
-                    stats_rsv_list.append({
-                        "Unidad": unidad,
-                        "Conductor": driver,
-                        "Infracciones Leves": leves,
-                        "Infracciones Medias": medias,
-                        "Infracciones Altas": graves,
-                        "Horas Motor": round(total_hm, 2),
-                        "Kilometraje Total": round(total_km, 2),
-                        "Total Scoring": scoring,
-                        "Puntaje ICM": icm,
-                        "Perfil Conductor": perfil
-                    })
+            if total_hm_c > 0 or total_km_c > 0 or len(df_drv_inf) > 0:
+                stats_conductores.append({
+                    "Conductor": driver,
+                    "Infracciones Leves": leves_c,
+                    "Infracciones Medias": medias_c,
+                    "Infracciones Altas": graves_c,
+                    "Horas Motor": round(total_hm_c, 2),
+                    "Kilometraje Total": round(total_km_c, 2),
+                    "Total Scoring": scoring_c,
+                    "Puntaje ICM": icm_c,
+                    "Perfil Conductor": perfil
+                })
 
         # 6. Preparar DataFrame de detalle visual
         df_infracciones_filtradas = df_inf[df_inf['Severidad'] != 'OK'].copy()
@@ -250,7 +279,7 @@ class RulesEngine:
                 cols.insert(1, cols.pop(cols.index('Conductor')))
             df_infracciones_filtradas = df_infracciones_filtradas[cols]
             
-        return df_infracciones_filtradas, stats_rsv_list
+        return df_infracciones_filtradas, stats_rsv_unidades, stats_conductores
 
 # ==========================================
 # 4. INTERFAZ FRONTEND (STREAMLIT)
@@ -300,7 +329,6 @@ if st.session_state.wialon:
         else:
             name_to_id = {v: k for k, v in st.session_state.real_groups.items()}
             elementos_seleccionados = st.multiselect("3️⃣ Seleccioná los Grupos", sorted(list(name_to_id.keys())))
-            st.caption("⚠️ Obligatorio: La plantilla en Wialon debe incluir columna 'Unidad' o 'Vehículo'.")
 
     with col2:
         col_d1, col_d2 = st.columns(2)
@@ -311,14 +339,15 @@ if st.session_state.wialon:
         if not elementos_seleccionados or not plantilla_seleccionada:
             st.warning("Seleccioná la plantilla y al menos un elemento a auditar.")
         else:
-            with st.spinner("Analizando operación y cruzando datos masivos..."):
+            with st.spinner("Analizando operación, escaneando unidades y evaluando conductores..."):
                 start_ts = int(time.mktime(d_start.timetuple()))
                 end_ts = int(time.mktime(d_end.timetuple())) + 86399 
                 res_id, tmpl_id = st.session_state.templates[plantilla_seleccionada]
                 config = {'leve_min': cfg_leve, 'medio_min': cfg_medio, 'grave_min': cfg_grave}
                 
                 df_master_infracciones = pd.DataFrame()
-                lista_rsv = [] 
+                lista_rsv_unidades = [] 
+                lista_conductores = []
                 all_raw_tables = {} 
                 
                 try:
@@ -331,17 +360,15 @@ if st.session_state.wialon:
                             table_key = f"{nombre_elemento} - {label}"
                             all_raw_tables[table_key] = df
                         
-                        df_infract, stats_rsv_list = RulesEngine.procesar_infracciones(dfs_dict, config, nombre_elemento)
+                        df_infract, stats_rsv_un, stats_cond = RulesEngine.procesar_infracciones(dfs_dict, config, nombre_elemento)
                         
-                        if stats_rsv_list: 
-                            lista_rsv.extend(stats_rsv_list)
-                        
-                        if not df_infract.empty: 
-                            df_master_infracciones = pd.concat([df_master_infracciones, df_infract], ignore_index=True)
+                        if stats_rsv_un: lista_rsv_unidades.extend(stats_rsv_un)
+                        if stats_cond: lista_conductores.extend(stats_cond)
+                        if not df_infract.empty: df_master_infracciones = pd.concat([df_master_infracciones, df_infract], ignore_index=True)
                     
                     st.success("✅ ¡Auditoría Finalizada con éxito!")
                     
-                    tab1, tab2, tab3 = st.tabs(["📋 Detalle de Infracciones", "📊 Reporte tipo RSV", "💾 Tablas Originales"])
+                    tab1, tab2, tab3, tab4 = st.tabs(["📋 Detalle Infracciones", "🚚 RSV Unidades", "👤 Evaluación Conductores", "💾 Tablas Originales"])
                     
                     with tab1:
                         if not df_master_infracciones.empty:
@@ -361,27 +388,39 @@ if st.session_state.wialon:
                             st.info("No hubo excesos de velocidad según los parámetros establecidos.")
 
                     with tab2:
-                        if lista_rsv:
-                            df_rsv = pd.DataFrame(lista_rsv)
-                            st.subheader("Resumen de Seguridad Vial (RSV) y Evaluación por Conductor")
+                        if lista_rsv_unidades:
+                            df_rsv_u = pd.DataFrame(lista_rsv_unidades)
+                            st.subheader("Resumen de Seguridad Vial (Solo estado de las Unidades)")
+                            st.dataframe(df_rsv_u, use_container_width=True, hide_index=True)
+                            
+                            buffer_rsv_u = io.BytesIO()
+                            with pd.ExcelWriter(buffer_rsv_u, engine='openpyxl') as writer:
+                                df_rsv_u.to_excel(writer, index=False, sheet_name='RSV_Unidades')
+                            st.download_button("📥 Descargar RSV Unidades (Excel)", data=buffer_rsv_u.getvalue(), file_name=f"RSV_Unidades_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        else:
+                            st.warning("⚠️ No se pudieron generar datos para las unidades.")
+
+                    with tab3:
+                        if lista_conductores:
+                            df_cond = pd.DataFrame(lista_conductores)
+                            st.subheader("Evaluación de Desempeño por Conductor (ICM)")
                             
                             def color_perfil(val):
                                 if 'Rojo' in str(val): return 'background-color: #ff4d4d; color: white;'
-                                if 'Naranja' in str(val): return 'background-color: #ffa64d;'
                                 if 'Amarillo' in str(val): return 'background-color: #ffff66;'
                                 if 'Verde' in str(val): return 'background-color: #85e085;'
                                 return ''
                                 
-                            st.dataframe(df_rsv.style.map(color_perfil, subset=['Perfil Conductor']), use_container_width=True, hide_index=True)
+                            st.dataframe(df_cond.style.map(color_perfil, subset=['Perfil Conductor']), use_container_width=True, hide_index=True)
                             
-                            buffer_rsv = io.BytesIO()
-                            with pd.ExcelWriter(buffer_rsv, engine='openpyxl') as writer:
-                                df_rsv.to_excel(writer, index=False, sheet_name='Reporte_RSV')
-                            st.download_button("📥 Descargar Reporte RSV (Excel)", data=buffer_rsv.getvalue(), file_name=f"RSV_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                            buffer_cond = io.BytesIO()
+                            with pd.ExcelWriter(buffer_cond, engine='openpyxl') as writer:
+                                df_cond.to_excel(writer, index=False, sheet_name='Evaluacion_Conductores')
+                            st.download_button("📥 Descargar Evaluación (Excel)", data=buffer_cond.getvalue(), file_name=f"Eval_Conductores_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         else:
-                            st.warning("⚠️ No se pudieron generar datos RSV.")
+                            st.warning("⚠️ No se encontraron conductores en el reporte.")
 
-                    with tab3:
+                    with tab4:
                         st.subheader("Descarga directa de tablas de Wialon")
                         for table_name, df_raw in all_raw_tables.items():
                             if not df_raw.empty:
